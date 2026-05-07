@@ -3,7 +3,7 @@ import { Feature } from "./Feature";
 import { ObsidianSettings } from "../services/ObsidianSettings";
 import { Settings } from "../services/Settings";
 
-const BETTER_LISTS_BODY_CLASS = "outliner-plugin-better-lists";
+const BETTER_LISTS_BODY_CLASS = "outliner-plus-better-lists";
 
 export class BetterListsStyles implements Feature {
   private updateBodyClassInterval: number;

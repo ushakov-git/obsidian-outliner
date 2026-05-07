@@ -43,7 +43,7 @@ export default class ObsidianOutlinerPlugin extends Plugin {
   private imeDetector: IMEDetector;
 
   async onload() {
-    console.log(`Loading obsidian-outliner`);
+    console.log(`Loading obsidian-outliner-plus`);
 
     await this.prepareSettings();
 
@@ -174,7 +174,7 @@ export default class ObsidianOutlinerPlugin extends Plugin {
   }
 
   async onunload() {
-    console.log(`Unloading obsidian-outliner`);
+    console.log(`Unloading obsidian-outliner-plus`);
 
     await this.imeDetector.unload();
 

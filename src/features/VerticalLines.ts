@@ -15,7 +15,7 @@ import { ObsidianSettings } from "../services/ObsidianSettings";
 import { Parser } from "../services/Parser";
 import { Settings } from "../services/Settings";
 
-const VERTICAL_LINES_BODY_CLASS = "outliner-plugin-vertical-lines";
+const VERTICAL_LINES_BODY_CLASS = "outliner-plus-vertical-lines";
 
 interface LineData {
   top: number;
@@ -59,11 +59,11 @@ class VerticalLinesPluginValue implements PluginValue {
   private prepareDom() {
     this.contentContainer = document.createElement("div");
     this.contentContainer.classList.add(
-      "outliner-plugin-list-lines-content-container",
+      "outliner-plus-list-lines-content-container",
     );
 
     this.scroller = document.createElement("div");
-    this.scroller.classList.add("outliner-plugin-list-lines-scroller");
+    this.scroller.classList.add("outliner-plus-list-lines-scroller");
 
     this.scroller.appendChild(this.contentContainer);
     this.view.dom.appendChild(this.scroller);
@@ -285,7 +285,7 @@ class VerticalLinesPluginValue implements PluginValue {
     for (let i = 0; i < this.lines.length; i++) {
       if (this.lineElements.length === i) {
         const e = document.createElement("div");
-        e.classList.add("outliner-plugin-list-line");
+        e.classList.add("outliner-plus-list-line");
         e.dataset.index = String(i);
         e.addEventListener("mousedown", this.onClick);
         this.contentContainer.appendChild(e);

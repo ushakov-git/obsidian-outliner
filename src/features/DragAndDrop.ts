@@ -17,7 +17,7 @@ import { OperationPerformer } from "../services/OperationPerformer";
 import { Parser } from "../services/Parser";
 import { Settings } from "../services/Settings";
 
-const BODY_CLASS = "outliner-plugin-dnd";
+const BODY_CLASS = "outliner-plus-dnd";
 
 export class DragAndDrop implements Feature {
   private dropZone: HTMLDivElement;
@@ -61,9 +61,9 @@ export class DragAndDrop implements Feature {
 
   private createDropZone() {
     this.dropZonePadding = document.createElement("div");
-    this.dropZonePadding.classList.add("outliner-plugin-drop-zone-padding");
+    this.dropZonePadding.classList.add("outliner-plus-drop-zone-padding");
     this.dropZone = document.createElement("div");
-    this.dropZone.classList.add("outliner-plugin-drop-zone");
+    this.dropZone.classList.add("outliner-plus-drop-zone");
     this.dropZone.style.display = "none";
     this.dropZone.appendChild(this.dropZonePadding);
     document.body.appendChild(this.dropZone);
@@ -323,11 +323,11 @@ export class DragAndDrop implements Feature {
       effects: [dndStarted.of(lines)],
     });
 
-    document.body.classList.add("outliner-plugin-dragging");
+    document.body.classList.add("outliner-plus-dragging");
   }
 
   private unhightlightDraggingLines() {
-    document.body.classList.remove("outliner-plugin-dragging");
+    document.body.classList.remove("outliner-plus-dragging");
 
     this.state.view.dispatch({
       effects: [dndEnded.of()],
@@ -598,11 +598,11 @@ const dndMoved = StateEffect.define<number | null>({
 const dndEnded = StateEffect.define<void>();
 
 const draggingLineDecoration = Decoration.line({
-  class: "outliner-plugin-dragging-line",
+  class: "outliner-plus-dragging-line",
 });
 
 const droppingLineDecoration = Decoration.line({
-  class: "outliner-plugin-dropping-line",
+  class: "outliner-plus-dropping-line",
 });
 
 const draggingLinesStateField = StateField.define<DecorationSet>({

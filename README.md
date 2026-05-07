@@ -1,15 +1,19 @@
-# Obsidian Outliner
-
-![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/vslinko/obsidian-outliner/build.yml?style=for-the-badge&branch=main)
-![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/vslinko/obsidian-outliner?style=for-the-badge&sort=semver)
+# Outliner Plus
 
 **Work with your lists like in Workflowy or RoamResearch**
 
-⁉️ [Discuss ideas or ask a question](https://github.com/vslinko/obsidian-outliner/discussions)<br>
-⚙️ [Follow the development process](https://github.com/users/vslinko/projects/3/views/1)<br>
-🐛 [Report issues](https://github.com/vslinko/obsidian-outliner/issues)
+> **Note:** This is a personal fork of [obsidian-outliner](https://github.com/vslinko/obsidian-outliner) by Viacheslav Slinko, distributed under the MIT License. Modifications by Evgeny Dorland — see [Differences from upstream](#differences-from-upstream).
+
+🐛 [Report issues for this fork](https://github.com/ushakov-git/obsidian-outliner/issues)
 
 Compatible with [Obsidian Zoom plugin](https://github.com/vslinko/obsidian-zoom).
+
+## Differences from upstream
+
+This fork adds the following on top of [vslinko/obsidian-outliner](https://github.com/vslinko/obsidian-outliner):
+
+- **Stage 1 — Cross-group bullet drag-and-drop.** You can now drag a bullet item between two separate bullet groups (separated by blank lines) in a single Markdown note. The original plugin only allowed dragging within one contiguous bullet group.
+- More changes coming (drag plain-text lines, multi-line drag).
 
 ## Demo
 
@@ -131,18 +135,10 @@ Open DevTools (Command+Option+I or Control+Shift+I) to copy the debug logs.
 
 - [Manipulation with multiple lines](https://github.com/vslinko/obsidian-outliner/issues/3)
 
+## Acknowledgements
+
+This project is a derivative work based on [obsidian-outliner](https://github.com/vslinko/obsidian-outliner) by Viacheslav Slinko, distributed under the MIT License. Huge thanks to him and all the original contributors for the foundation.
+
 ## Pricing
 
 This plugin is free for everyone.
-
-### Patrons & Supporters
-
-I want to say thank you to the people who support me, I really appreciate it!
-
-- [Lucas D](https://twitter.com/lucasdreier)
-- Philipp K.
-- [Daniel B.](https://github.com/danieltomasz)
-- Mat Rhein ([@mat_rhein7](http://twitter.com/mat_rhein7))
-- [Ollie Lovell](https://www.ollielovell.com/)
-- Faiz MK ([@faizkhuzaimah](https://twitter.com/faizkhuzaimah))
-- more patrons and anonymous supporters

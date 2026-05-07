@@ -1,7 +1,7 @@
 {
-  "name": "obsidian-outliner",
-  "version": "4.10.0",
-  "description": "Work with your lists like in Workflowy or RoamResearch.",
+  "name": "obsidian-outliner-plus",
+  "version": "5.0.0",
+  "description": "Personal fork of obsidian-outliner with cross-group bullet drag-and-drop and other improvements.",
   "main": "dist/main.js",
   "scripts": {
     "dev": "rollup --config rollup.config.mjs -w --configWithTests",
@@ -12,7 +12,7 @@
     "test:unit": "SKIP_OBSIDIAN=1 jest --forceExit src",
     "prepare": "husky"
   },
-  "author": "Viacheslav Slinko",
+  "author": "Evgeny Dorland",
   "license": "MIT",
   "devDependencies": {
     "@babel/core": "^7.29.0",
