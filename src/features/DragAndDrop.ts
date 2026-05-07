@@ -7,8 +7,11 @@ import { Decoration, DecorationSet, EditorView } from "@codemirror/view";
 import { Feature } from "./Feature";
 
 import { MyEditor, getEditorFromState } from "../editor";
+import { MoveListBetweenRoots } from "../operations/MoveListBetweenRoots";
 import { MoveListToDifferentPosition } from "../operations/MoveListToDifferentPosition";
 import { List, Root, cmpPos } from "../root";
+import { ChangesApplicator } from "../services/ChangesApplicator";
+import { parseDocumentByBlankLines } from "../services/MultiRootDocument";
 import { ObsidianSettings } from "../services/ObsidianSettings";
 import { OperationPerformer } from "../services/OperationPerformer";
 import { Parser } from "../services/Parser";
@@ -156,9 +159,21 @@ export class DragAndDrop implements Feature {
 
     const editor = getEditorFromState(view.state);
     const pos = editor.offsetToPos(view.posAtCoords({ x, y }));
-    const root = this.parser.parse(editor, pos);
-    const list = root.getListUnderLine(pos.line);
-    const state = new DragAndDropState(view, editor, root, list);
+    const roots = parseDocumentByBlankLines(this.parser, editor);
+    if (roots.length === 0) {
+      return;
+    }
+
+    const sourceRoot = findRootContaining(roots, pos.line);
+    if (!sourceRoot) {
+      return;
+    }
+    const list = sourceRoot.getListUnderLine(pos.line);
+    if (!list) {
+      return;
+    }
+
+    const state = new DragAndDropState(view, editor, roots, sourceRoot, list);
 
     if (!state.hasDropVariants()) {
       return;
@@ -170,6 +185,11 @@ export class DragAndDrop implements Feature {
 
   private detectAndDrawDropZone(x: number, y: number) {
     this.state.calculateNearestDropVariant(x, y);
+    if (!this.state.dropVariant) {
+      this.hideDropZone();
+      this.state.view.dispatch({ effects: [dndMoved.of(null)] });
+      return;
+    }
     this.drawDropZone();
   }
 
@@ -181,8 +201,11 @@ export class DragAndDrop implements Feature {
   private stopDragging() {
     this.unhightlightDraggingLines();
     this.hideDropZone();
-    this.applyChanges();
-    this.state = null;
+    try {
+      this.applyChanges();
+    } finally {
+      this.state = null;
+    }
   }
 
   private applyChanges() {
@@ -191,10 +214,10 @@ export class DragAndDrop implements Feature {
     }
 
     const { state } = this;
-    const { dropVariant, editor, root, list } = state;
+    const { dropVariant, editor, sourceRoot, roots, list } = state;
 
-    const newRoot = this.parser.parse(editor, root.getContentStart());
-    if (!isSameRoots(root, newRoot)) {
+    const freshRoots = parseDocumentByBlankLines(this.parser, editor);
+    if (!isSameMultiRoot(roots, freshRoots)) {
       new Notice(
         `The item cannot be moved. The page content changed during the move.`,
         5000,
@@ -202,17 +225,88 @@ export class DragAndDrop implements Feature {
       return;
     }
 
-    this.operationPerformer.eval(
-      root,
-      new MoveListToDifferentPosition(
-        root,
-        list,
-        dropVariant.placeToMove,
-        dropVariant.whereToMove,
-        this.obisidian.getDefaultIndentChars(),
-      ),
+    const targetRoot = dropVariant.targetRoot;
+
+    if (sourceRoot === targetRoot) {
+      this.operationPerformer.eval(
+        sourceRoot,
+        new MoveListToDifferentPosition(
+          sourceRoot,
+          list,
+          dropVariant.placeToMove,
+          dropVariant.whereToMove,
+          this.obisidian.getDefaultIndentChars(),
+        ),
+        editor,
+      );
+      return;
+    }
+
+    this.applyCrossRootMove(
       editor,
+      sourceRoot,
+      targetRoot,
+      list,
+      dropVariant.placeToMove,
+      dropVariant.whereToMove,
     );
+  }
+
+  private applyCrossRootMove(
+    editor: MyEditor,
+    sourceRoot: Root,
+    targetRoot: Root,
+    listToMove: List,
+    placeToMove: List,
+    whereToMove: "before" | "after" | "inside",
+  ) {
+    const prevSourceRoot = sourceRoot.clone();
+    const prevTargetRoot = targetRoot.clone();
+
+    const op = new MoveListBetweenRoots(
+      sourceRoot,
+      targetRoot,
+      listToMove,
+      placeToMove,
+      whereToMove,
+      this.obisidian.getDefaultIndentChars(),
+    );
+    op.perform();
+
+    if (!op.shouldUpdate()) {
+      return;
+    }
+
+    const applicator = new ChangesApplicator();
+
+    const sourceFirst =
+      sourceRoot.getContentStart().line > targetRoot.getContentStart().line;
+
+    const movedListInTarget = op.getMovedListInTarget();
+    const finalCursor = movedListInTarget
+      ? movedListInTarget.getLastLineContentEnd()
+      : null;
+
+    // Avoid setSelections inside each apply() — coordinates from old document
+    // state may point outside the document after the first apply mutates it.
+    // Use safe placeholder selections; we'll set the real cursor once at the end.
+    const safeSelection = [
+      { anchor: { line: 0, ch: 0 }, head: { line: 0, ch: 0 } },
+    ];
+    sourceRoot.replaceSelections(safeSelection);
+    targetRoot.replaceSelections(safeSelection);
+
+    if (sourceFirst) {
+      applicator.apply(editor, prevSourceRoot, sourceRoot);
+      applicator.apply(editor, prevTargetRoot, targetRoot);
+    } else {
+      applicator.apply(editor, prevTargetRoot, targetRoot);
+      applicator.apply(editor, prevSourceRoot, sourceRoot);
+    }
+
+    if (finalCursor) {
+      editor.setSelections([{ anchor: finalCursor, head: finalCursor }]);
+    }
   }
 
   private highlightDraggingLines() {
@@ -302,6 +396,7 @@ interface DropVariant {
   left: number;
   top: number;
   placeToMove: List;
+  targetRoot: Root;
   whereToMove: "after" | "before" | "inside";
 }
 
@@ -320,12 +415,17 @@ class DragAndDropState {
   constructor(
     public readonly view: EditorView,
     public readonly editor: MyEditor,
-    public readonly root: Root,
+    public readonly roots: Root[],
+    public readonly sourceRoot: Root,
     public readonly list: List,
   ) {
     this.collectDropVariants();
     this.calculateLeftPadding();
     this.calculateTabWidth();
+  }
+
+  get root(): Root {
+    return this.sourceRoot;
   }
 
   getDropVariants() {
@@ -374,6 +474,11 @@ class DragAndDropState {
       possibleDropVariants.push(v);
     }
 
+    if (possibleDropVariants.length === 0) {
+      this.dropVariant = null;
+      return;
+    }
+
     const nearestLineTop = possibleDropVariants
       .sort((a, b) => Math.abs(y - a.top) - Math.abs(y - b.top))
       .first().top;
@@ -392,7 +497,7 @@ class DragAndDropState {
   }
 
   private collectDropVariants() {
-    const visit = (lists: List[]) => {
+    const visit = (lists: List[], targetRoot: Root) => {
       for (const placeToMove of lists) {
         const lineBefore = placeToMove.getFirstLineContentStart().line;
         const lineAfter = placeToMove.getContentEndIncludingChildren().line + 1;
@@ -405,6 +510,7 @@ class DragAndDropState {
           left: 0,
           top: 0,
           placeToMove,
+          targetRoot,
           whereToMove: "before",
         });
         this.addDropVariant({
@@ -413,6 +519,7 @@ class DragAndDropState {
           left: 0,
           top: 0,
           placeToMove,
+          targetRoot,
           whereToMove: "after",
         });
 
@@ -427,15 +534,18 @@ class DragAndDropState {
             left: 0,
             top: 0,
             placeToMove,
+            targetRoot,
             whereToMove: "inside",
           });
         } else {
-          visit(placeToMove.getChildren());
+          visit(placeToMove.getChildren(), targetRoot);
         }
       }
     };
 
-    visit(this.root.getChildren());
+    for (const root of this.roots) {
+      visit(root.getChildren(), root);
+    }
   }
 
   private calculateLeftPadding() {
@@ -583,6 +693,29 @@ function isSameRoots(a: Root, b: Root) {
   }
 
   return a.print() === b.print();
+}
+
+function isSameMultiRoot(a: Root[], b: Root[]) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (!isSameRoots(a[i], b[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findRootContaining(roots: Root[], line: number): Root | null {
+  for (const root of roots) {
+    const start = root.getContentStart().line;
+    const end = root.getContentEnd().line;
+    if (line >= start && line <= end) {
+      return root;
+    }
+  }
+  return null;
 }
 
 function isFeatureSupported() {
