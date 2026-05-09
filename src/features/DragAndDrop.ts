@@ -11,6 +11,10 @@ import { MoveListBetweenRoots } from "../operations/MoveListBetweenRoots";
 import { MoveListToDifferentPosition } from "../operations/MoveListToDifferentPosition";
 import { List, Root, cmpPos } from "../root";
 import { ChangesApplicator } from "../services/ChangesApplicator";
+import {
+  LenientBullet,
+  LenientBulletScanner,
+} from "../services/LenientBulletScanner";
 import { parseDocumentByBlankLines } from "../services/MultiRootDocument";
 import { ObsidianSettings } from "../services/ObsidianSettings";
 import { OperationPerformer } from "../services/OperationPerformer";
@@ -160,20 +164,47 @@ export class DragAndDrop implements Feature {
     const editor = getEditorFromState(view.state);
     const pos = editor.offsetToPos(view.posAtCoords({ x, y }));
     const roots = parseDocumentByBlankLines(this.parser, editor);
-    if (roots.length === 0) {
+
+    const tabSize = this.obisidian.getTabsSettings().tabSize;
+    const lenientBullets = new LenientBulletScanner().scan(editor, tabSize);
+
+    let source: DragSource | null = null;
+
+    const strictRoot = findRootContaining(roots, pos.line);
+    const strictList = strictRoot
+      ? strictRoot.getListUnderLine(pos.line)
+      : null;
+    if (strictRoot && strictList) {
+      source = {
+        kind: "strict",
+        list: strictList,
+        root: strictRoot,
+        lineStart: strictList.getFirstLineContentStart().line,
+        lineEnd: strictList.getContentEndIncludingChildren().line,
+      };
+    } else {
+      const lenient = findLenientBulletAtLine(lenientBullets, pos.line);
+      if (lenient) {
+        source = {
+          kind: "lenient",
+          bullet: lenient,
+          lineStart: lenient.lineStart,
+          lineEnd: lenient.lineEnd,
+        };
+      }
+    }
+
+    if (!source) {
       return;
     }
 
-    const sourceRoot = findRootContaining(roots, pos.line);
-    if (!sourceRoot) {
-      return;
-    }
-    const list = sourceRoot.getListUnderLine(pos.line);
-    if (!list) {
-      return;
-    }
-
-    const state = new DragAndDropState(view, editor, roots, sourceRoot, list);
+    const state = new DragAndDropState(
+      view,
+      editor,
+      roots,
+      lenientBullets,
+      source,
+    );
 
     if (!state.hasDropVariants()) {
       return;
@@ -214,7 +245,7 @@ export class DragAndDrop implements Feature {
     }
 
     const { state } = this;
-    const { dropVariant, editor, sourceRoot, roots, list } = state;
+    const { dropVariant, editor, source, roots } = state;
 
     const freshRoots = parseDocumentByBlankLines(this.parser, editor);
     if (!isSameMultiRoot(roots, freshRoots)) {
@@ -225,31 +256,162 @@ export class DragAndDrop implements Feature {
       return;
     }
 
-    const targetRoot = dropVariant.targetRoot;
-
-    if (sourceRoot === targetRoot) {
-      this.operationPerformer.eval(
-        sourceRoot,
-        new MoveListToDifferentPosition(
+    if (source.kind === "strict" && dropVariant.kind === "strict") {
+      const sourceRoot = source.root;
+      const targetRoot = dropVariant.targetRoot;
+      if (sourceRoot === targetRoot) {
+        this.operationPerformer.eval(
           sourceRoot,
-          list,
-          dropVariant.placeToMove,
-          dropVariant.whereToMove,
-          this.obisidian.getDefaultIndentChars(),
-        ),
+          new MoveListToDifferentPosition(
+            sourceRoot,
+            source.list,
+            dropVariant.placeToMove,
+            dropVariant.whereToMove,
+            this.obisidian.getDefaultIndentChars(),
+          ),
+          editor,
+        );
+        return;
+      }
+      this.applyCrossRootMove(
         editor,
+        sourceRoot,
+        targetRoot,
+        source.list,
+        dropVariant.placeToMove,
+        dropVariant.whereToMove,
       );
       return;
     }
 
-    this.applyCrossRootMove(
-      editor,
-      sourceRoot,
-      targetRoot,
-      list,
-      dropVariant.placeToMove,
-      dropVariant.whereToMove,
-    );
+    this.applyTextLevelMove(editor, source, dropVariant);
+  }
+
+  private applyTextLevelMove(
+    editor: MyEditor,
+    source: DragSource,
+    dropVariant: DropVariant,
+  ) {
+    const indentUnit = this.obisidian.getDefaultIndentChars();
+
+    const sourceLineStart = source.lineStart;
+    const sourceLineEnd = source.lineEnd;
+    const sourceBaseIndent =
+      source.kind === "strict"
+        ? source.list.getFirstLineIndent()
+        : source.bullet.rawIndent;
+
+    let targetLineStart: number;
+    let targetLineEnd: number;
+    let targetBaseIndent: string;
+    let insertWhere: "before" | "after" | "inside";
+    if (dropVariant.kind === "strict") {
+      const place = dropVariant.placeToMove;
+      targetLineStart = place.getFirstLineContentStart().line;
+      targetLineEnd = place.getContentEndIncludingChildren().line;
+      targetBaseIndent = place.getFirstLineIndent();
+      insertWhere = dropVariant.whereToMove;
+    } else {
+      const place = dropVariant.placeToMove;
+      targetLineStart = place.lineStart;
+      targetLineEnd = place.lineEnd;
+      targetBaseIndent = place.rawIndent;
+      insertWhere = dropVariant.whereToMove;
+    }
+
+    if (
+      sourceLineStart <= targetLineStart &&
+      targetLineStart <= sourceLineEnd
+    ) {
+      return;
+    }
+
+    let insertAtLine: number;
+    let newBaseIndent: string;
+    if (insertWhere === "before") {
+      insertAtLine = targetLineStart;
+      newBaseIndent = targetBaseIndent;
+    } else if (insertWhere === "after") {
+      insertAtLine = targetLineEnd + 1;
+      newBaseIndent = targetBaseIndent;
+    } else {
+      insertAtLine = targetLineEnd + 1;
+      newBaseIndent = targetBaseIndent + indentUnit;
+    }
+
+    const sourceLines: string[] = [];
+    for (let i = sourceLineStart; i <= sourceLineEnd; i++) {
+      sourceLines.push(editor.getLine(i));
+    }
+
+    const reindented = sourceLines.map((line) => {
+      if (line.startsWith(sourceBaseIndent)) {
+        return newBaseIndent + line.slice(sourceBaseIndent.length);
+      }
+      return line;
+    });
+    const insertText = reindented.join("\n") + "\n";
+
+    const lastLine = editor.lastLine();
+    const sourceFromOffset = editor.posToOffset({
+      line: sourceLineStart,
+      ch: 0,
+    });
+    let sourceToOffset: number;
+    if (sourceLineEnd < lastLine) {
+      sourceToOffset = editor.posToOffset({
+        line: sourceLineEnd + 1,
+        ch: 0,
+      });
+    } else {
+      sourceToOffset = editor.posToOffset({
+        line: sourceLineEnd,
+        ch: editor.getLine(sourceLineEnd).length,
+      });
+    }
+
+    const insertAtClamped = Math.min(insertAtLine, lastLine + 1);
+    let insertOffset: number;
+    let insertPayload: string;
+    if (insertAtClamped > lastLine) {
+      insertOffset = editor.posToOffset({
+        line: lastLine,
+        ch: editor.getLine(lastLine).length,
+      });
+      insertPayload = "\n" + reindented.join("\n");
+    } else {
+      insertOffset = editor.posToOffset({
+        line: insertAtClamped,
+        ch: 0,
+      });
+      insertPayload = insertText;
+    }
+
+    const view = this.state.view;
+    view.dispatch({
+      changes: [
+        { from: sourceFromOffset, to: sourceToOffset, insert: "" },
+        { from: insertOffset, to: insertOffset, insert: insertPayload },
+      ],
+    });
+
+    let movedFirstLine: number;
+    if (insertAtLine <= sourceLineStart) {
+      movedFirstLine = insertAtLine;
+    } else {
+      movedFirstLine = insertAtLine - (sourceLineEnd - sourceLineStart + 1);
+    }
+    const movedLineCount = sourceLineEnd - sourceLineStart + 1;
+    const movedLastLine = movedFirstLine + movedLineCount - 1;
+    const movedLastLineText =
+      newBaseIndent +
+      sourceLines[sourceLines.length - 1].slice(sourceBaseIndent.length);
+    editor.setSelections([
+      {
+        anchor: { line: movedLastLine, ch: movedLastLineText.length },
+        head: { line: movedLastLine, ch: movedLastLineText.length },
+      },
+    ]);
   }
 
   private applyCrossRootMove(
@@ -311,12 +473,10 @@ export class DragAndDrop implements Feature {
 
   private highlightDraggingLines() {
     const { state } = this;
-    const { list, editor, view } = state;
+    const { source, editor, view } = state;
 
     const lines = [];
-    const fromLine = list.getFirstLineContentStart().line;
-    const tillLine = list.getContentEndIncludingChildren().line;
-    for (let i = fromLine; i <= tillLine; i++) {
+    for (let i = source.lineStart; i <= source.lineEnd; i++) {
       lines.push(editor.posToOffset({ line: i, ch: 0 }));
     }
     view.dispatch({
@@ -338,11 +498,7 @@ export class DragAndDrop implements Feature {
     const { state } = this;
     const { view, editor, dropVariant } = state;
 
-    const newParent =
-      dropVariant.whereToMove === "inside"
-        ? dropVariant.placeToMove
-        : dropVariant.placeToMove.getParent();
-    const newParentIsRootList = !newParent.getParent();
+    const parentInfo = getDropVariantNewParent(dropVariant);
 
     {
       const width = Math.round(
@@ -357,7 +513,7 @@ export class DragAndDrop implements Feature {
     }
 
     {
-      const level = newParent.getLevel();
+      const level = parentInfo.level;
       const indentWidth = this.state.tabWidth;
       const width = indentWidth * level;
       const dashPadding = 3;
@@ -374,10 +530,10 @@ export class DragAndDrop implements Feature {
     this.state.view.dispatch({
       effects: [
         dndMoved.of(
-          newParentIsRootList
+          parentInfo.parentLine === null
             ? null
             : editor.posToOffset({
-                line: newParent.getFirstLineContentStart().line,
+                line: parentInfo.parentLine,
                 ch: 0,
               }),
         ),
@@ -390,15 +546,41 @@ export class DragAndDrop implements Feature {
   }
 }
 
-interface DropVariant {
-  line: number;
-  level: number;
-  left: number;
-  top: number;
-  placeToMove: List;
-  targetRoot: Root;
-  whereToMove: "after" | "before" | "inside";
-}
+type DragSource =
+  | {
+      kind: "strict";
+      list: List;
+      root: Root;
+      lineStart: number;
+      lineEnd: number;
+    }
+  | {
+      kind: "lenient";
+      bullet: LenientBullet;
+      lineStart: number;
+      lineEnd: number;
+    };
+
+type DropVariant =
+  | {
+      kind: "strict";
+      line: number;
+      level: number;
+      left: number;
+      top: number;
+      placeToMove: List;
+      targetRoot: Root;
+      whereToMove: "after" | "before" | "inside";
+    }
+  | {
+      kind: "lenient";
+      line: number;
+      level: number;
+      left: number;
+      top: number;
+      placeToMove: LenientBullet;
+      whereToMove: "after" | "before" | "inside";
+    };
 
 interface DragAndDropPreStartState {
   x: number;
@@ -416,16 +598,12 @@ class DragAndDropState {
     public readonly view: EditorView,
     public readonly editor: MyEditor,
     public readonly roots: Root[],
-    public readonly sourceRoot: Root,
-    public readonly list: List,
+    public readonly lenientBullets: LenientBullet[],
+    public readonly source: DragSource,
   ) {
     this.collectDropVariants();
     this.calculateLeftPadding();
     this.calculateTabWidth();
-  }
-
-  get root(): Root {
-    return this.sourceRoot;
   }
 
   getDropVariants() {
@@ -443,13 +621,16 @@ class DragAndDropState {
     const possibleDropVariants = [];
 
     for (const v of dropVariants) {
-      const { placeToMove } = v;
-
       const positionAfterList =
         v.whereToMove === "after" || v.whereToMove === "inside";
-      const line = positionAfterList
-        ? placeToMove.getContentEndIncludingChildren().line
-        : placeToMove.getFirstLineContentStart().line;
+      const line =
+        v.kind === "strict"
+          ? positionAfterList
+            ? v.placeToMove.getContentEndIncludingChildren().line
+            : v.placeToMove.getFirstLineContentStart().line
+          : positionAfterList
+            ? v.placeToMove.lineEnd
+            : v.placeToMove.lineStart;
       const linePos = editor.posToOffset({
         line,
         ch: 0,
@@ -497,6 +678,12 @@ class DragAndDropState {
   }
 
   private collectDropVariants() {
+    const sourceList = this.source.kind === "strict" ? this.source.list : null;
+    const sourceLenient =
+      this.source.kind === "lenient" ? this.source.bullet : null;
+    const sourceLineStart = this.source.lineStart;
+    const sourceLineEnd = this.source.lineEnd;
+
     const visit = (lists: List[], targetRoot: Root) => {
       for (const placeToMove of lists) {
         const lineBefore = placeToMove.getFirstLineContentStart().line;
@@ -505,6 +692,7 @@ class DragAndDropState {
         const level = placeToMove.getLevel();
 
         this.addDropVariant({
+          kind: "strict",
           line: lineBefore,
           level,
           left: 0,
@@ -514,6 +702,7 @@ class DragAndDropState {
           whereToMove: "before",
         });
         this.addDropVariant({
+          kind: "strict",
           line: lineAfter,
           level,
           left: 0,
@@ -523,12 +712,13 @@ class DragAndDropState {
           whereToMove: "after",
         });
 
-        if (placeToMove === this.list) {
+        if (placeToMove === sourceList) {
           continue;
         }
 
         if (placeToMove.isEmpty()) {
           this.addDropVariant({
+            kind: "strict",
             line: lineAfter,
             level: level + 1,
             left: 0,
@@ -545,6 +735,51 @@ class DragAndDropState {
 
     for (const root of this.roots) {
       visit(root.getChildren(), root);
+    }
+
+    for (const b of this.lenientBullets) {
+      if (findRootContaining(this.roots, b.lineStart)) {
+        continue;
+      }
+      if (
+        sourceLenient &&
+        b.lineStart >= sourceLineStart &&
+        b.lineStart <= sourceLineEnd
+      ) {
+        continue;
+      }
+
+      const level = b.visualLevel + 1;
+
+      this.addDropVariant({
+        kind: "lenient",
+        line: b.lineStart,
+        level,
+        left: 0,
+        top: 0,
+        placeToMove: b,
+        whereToMove: "before",
+      });
+      this.addDropVariant({
+        kind: "lenient",
+        line: b.lineEnd + 1,
+        level,
+        left: 0,
+        top: 0,
+        placeToMove: b,
+        whereToMove: "after",
+      });
+      if (b.children.length === 0) {
+        this.addDropVariant({
+          kind: "lenient",
+          line: b.lineEnd + 1,
+          level: level + 1,
+          left: 0,
+          top: 0,
+          placeToMove: b,
+          whereToMove: "inside",
+        });
+      }
     }
   }
 
@@ -716,6 +951,43 @@ function findRootContaining(roots: Root[], line: number): Root | null {
     }
   }
   return null;
+}
+
+function findLenientBulletAtLine(
+  bullets: LenientBullet[],
+  line: number,
+): LenientBullet | null {
+  for (const b of bullets) {
+    if (b.lineStart === line) {
+      return b;
+    }
+  }
+  return null;
+}
+
+function getDropVariantNewParent(v: DropVariant): {
+  level: number;
+  parentLine: number | null;
+} {
+  if (v.kind === "strict") {
+    const newParent =
+      v.whereToMove === "inside" ? v.placeToMove : v.placeToMove.getParent();
+    const isRoot = !newParent.getParent();
+    return {
+      level: newParent.getLevel(),
+      parentLine: isRoot ? null : newParent.getFirstLineContentStart().line,
+    };
+  }
+
+  const newParent =
+    v.whereToMove === "inside" ? v.placeToMove : v.placeToMove.parent;
+  if (!newParent) {
+    return { level: 0, parentLine: null };
+  }
+  return {
+    level: newParent.visualLevel + 1,
+    parentLine: newParent.lineStart,
+  };
 }
 
 function isFeatureSupported() {
