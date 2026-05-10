@@ -201,12 +201,14 @@ export class DragAndDrop implements Feature {
     const state = new DragAndDropState(
       view,
       editor,
+      source,
+      this.parser,
+      tabSize,
       roots,
       lenientBullets,
-      source,
     );
 
-    if (!state.hasDropVariants()) {
+    if (!state.hasAnyDropVariants()) {
       return;
     }
 
@@ -215,10 +217,28 @@ export class DragAndDrop implements Feature {
   }
 
   private detectAndDrawDropZone(x: number, y: number) {
-    this.state.calculateNearestDropVariant(x, y);
+    const targetView = findEditorViewAtPoint(x, y);
+
+    if (
+      this.state.lastDropTargetView &&
+      this.state.lastDropTargetView !== targetView
+    ) {
+      this.state.lastDropTargetView.dispatch({ effects: [dndMoved.of(null)] });
+    }
+    this.state.lastDropTargetView = targetView;
+
+    if (!targetView) {
+      this.state.dropVariant = null;
+      this.hideDropZone();
+      return;
+    }
+
+    const data = this.state.getOrBuildTargetData(targetView);
+    this.state.calculateNearestDropVariantForView(x, y, data);
+
     if (!this.state.dropVariant) {
       this.hideDropZone();
-      this.state.view.dispatch({ effects: [dndMoved.of(null)] });
+      targetView.dispatch({ effects: [dndMoved.of(null)] });
       return;
     }
     this.drawDropZone();
@@ -226,14 +246,16 @@ export class DragAndDrop implements Feature {
 
   private cancelDragging() {
     this.state.dropVariant = null;
-    this.stopDragging();
+    this.stopDragging(true);
   }
 
-  private stopDragging() {
+  private stopDragging(cancelled = false) {
     this.unhightlightDraggingLines();
     this.hideDropZone();
     try {
-      this.applyChanges();
+      if (!cancelled) {
+        this.applyChanges();
+      }
     } finally {
       this.state = null;
     }
@@ -241,14 +263,15 @@ export class DragAndDrop implements Feature {
 
   private applyChanges() {
     if (!this.state.dropVariant) {
+      this.maybeNoticeEmptyTarget();
       return;
     }
 
     const { state } = this;
-    const { dropVariant, editor, source, roots } = state;
+    const { dropVariant, source, sourceEditor, sourceView } = state;
 
-    const freshRoots = parseDocumentByBlankLines(this.parser, editor);
-    if (!isSameMultiRoot(roots, freshRoots)) {
+    const freshRoots = parseDocumentByBlankLines(this.parser, sourceEditor);
+    if (!isSameMultiRoot(state.getSourceData().roots, freshRoots)) {
       new Notice(
         `The item cannot be moved. The page content changed during the move.`,
         5000,
@@ -256,7 +279,9 @@ export class DragAndDrop implements Feature {
       return;
     }
 
-    if (source.kind === "strict" && dropVariant.kind === "strict") {
+    const sameView = dropVariant.view === sourceView;
+
+    if (sameView && source.kind === "strict" && dropVariant.kind === "strict") {
       const sourceRoot = source.root;
       const targetRoot = dropVariant.targetRoot;
       if (sourceRoot === targetRoot) {
@@ -269,12 +294,12 @@ export class DragAndDrop implements Feature {
             dropVariant.whereToMove,
             this.obisidian.getDefaultIndentChars(),
           ),
-          editor,
+          sourceEditor,
         );
         return;
       }
       this.applyCrossRootMove(
-        editor,
+        sourceEditor,
         sourceRoot,
         targetRoot,
         source.list,
@@ -284,15 +309,16 @@ export class DragAndDrop implements Feature {
       return;
     }
 
-    this.applyTextLevelMove(editor, source, dropVariant);
+    this.applyTextLevelMove(source, dropVariant);
   }
 
-  private applyTextLevelMove(
-    editor: MyEditor,
-    source: DragSource,
-    dropVariant: DropVariant,
-  ) {
+  private applyTextLevelMove(source: DragSource, dropVariant: DropVariant) {
     const indentUnit = this.obisidian.getDefaultIndentChars();
+    const sourceEditor = this.state.sourceEditor;
+    const sourceView = this.state.sourceView;
+    const targetEditor = dropVariant.editor;
+    const targetView = dropVariant.view;
+    const sameView = sourceView === targetView;
 
     const sourceLineStart = source.lineStart;
     const sourceLineEnd = source.lineEnd;
@@ -304,22 +330,21 @@ export class DragAndDrop implements Feature {
     let targetLineStart: number;
     let targetLineEnd: number;
     let targetBaseIndent: string;
-    let insertWhere: "before" | "after" | "inside";
+    const insertWhere = dropVariant.whereToMove;
     if (dropVariant.kind === "strict") {
       const place = dropVariant.placeToMove;
       targetLineStart = place.getFirstLineContentStart().line;
       targetLineEnd = place.getContentEndIncludingChildren().line;
       targetBaseIndent = place.getFirstLineIndent();
-      insertWhere = dropVariant.whereToMove;
     } else {
       const place = dropVariant.placeToMove;
       targetLineStart = place.lineStart;
       targetLineEnd = place.lineEnd;
       targetBaseIndent = place.rawIndent;
-      insertWhere = dropVariant.whereToMove;
     }
 
     if (
+      sameView &&
       sourceLineStart <= targetLineStart &&
       targetLineStart <= sourceLineEnd
     ) {
@@ -341,34 +366,58 @@ export class DragAndDrop implements Feature {
 
     const sourceLines: string[] = [];
     for (let i = sourceLineStart; i <= sourceLineEnd; i++) {
-      sourceLines.push(editor.getLine(i));
+      sourceLines.push(sourceEditor.getLine(i));
+    }
+    const reindented = sourceLines.map((line) =>
+      line.startsWith(sourceBaseIndent)
+        ? newBaseIndent + line.slice(sourceBaseIndent.length)
+        : line,
+    );
+
+    if (sameView) {
+      this.applySameViewMove(
+        sourceView,
+        sourceEditor,
+        sourceLineStart,
+        sourceLineEnd,
+        insertAtLine,
+        reindented,
+      );
+      return;
     }
 
-    const reindented = sourceLines.map((line) => {
-      if (line.startsWith(sourceBaseIndent)) {
-        return newBaseIndent + line.slice(sourceBaseIndent.length);
-      }
-      return line;
-    });
-    const insertText = reindented.join("\n") + "\n";
+    this.applyCrossViewMove(
+      sourceView,
+      sourceEditor,
+      sourceLineStart,
+      sourceLineEnd,
+      targetView,
+      targetEditor,
+      insertAtLine,
+      reindented,
+    );
+  }
 
+  private applySameViewMove(
+    view: EditorView,
+    editor: MyEditor,
+    sourceLineStart: number,
+    sourceLineEnd: number,
+    insertAtLine: number,
+    reindented: string[],
+  ) {
     const lastLine = editor.lastLine();
     const sourceFromOffset = editor.posToOffset({
       line: sourceLineStart,
       ch: 0,
     });
-    let sourceToOffset: number;
-    if (sourceLineEnd < lastLine) {
-      sourceToOffset = editor.posToOffset({
-        line: sourceLineEnd + 1,
-        ch: 0,
-      });
-    } else {
-      sourceToOffset = editor.posToOffset({
-        line: sourceLineEnd,
-        ch: editor.getLine(sourceLineEnd).length,
-      });
-    }
+    const sourceToOffset =
+      sourceLineEnd < lastLine
+        ? editor.posToOffset({ line: sourceLineEnd + 1, ch: 0 })
+        : editor.posToOffset({
+            line: sourceLineEnd,
+            ch: editor.getLine(sourceLineEnd).length,
+          });
 
     const insertAtClamped = Math.min(insertAtLine, lastLine + 1);
     let insertOffset: number;
@@ -380,14 +429,10 @@ export class DragAndDrop implements Feature {
       });
       insertPayload = "\n" + reindented.join("\n");
     } else {
-      insertOffset = editor.posToOffset({
-        line: insertAtClamped,
-        ch: 0,
-      });
-      insertPayload = insertText;
+      insertOffset = editor.posToOffset({ line: insertAtClamped, ch: 0 });
+      insertPayload = reindented.join("\n") + "\n";
     }
 
-    const view = this.state.view;
     view.dispatch({
       changes: [
         { from: sourceFromOffset, to: sourceToOffset, insert: "" },
@@ -395,23 +440,114 @@ export class DragAndDrop implements Feature {
       ],
     });
 
-    let movedFirstLine: number;
-    if (insertAtLine <= sourceLineStart) {
-      movedFirstLine = insertAtLine;
-    } else {
-      movedFirstLine = insertAtLine - (sourceLineEnd - sourceLineStart + 1);
-    }
     const movedLineCount = sourceLineEnd - sourceLineStart + 1;
+    const movedFirstLine =
+      insertAtLine <= sourceLineStart
+        ? insertAtLine
+        : insertAtLine - movedLineCount;
     const movedLastLine = movedFirstLine + movedLineCount - 1;
-    const movedLastLineText =
-      newBaseIndent +
-      sourceLines[sourceLines.length - 1].slice(sourceBaseIndent.length);
+    const movedLastLineText = reindented[reindented.length - 1];
     editor.setSelections([
       {
         anchor: { line: movedLastLine, ch: movedLastLineText.length },
         head: { line: movedLastLine, ch: movedLastLineText.length },
       },
     ]);
+  }
+
+  private applyCrossViewMove(
+    sourceView: EditorView,
+    sourceEditor: MyEditor,
+    sourceLineStart: number,
+    sourceLineEnd: number,
+    targetView: EditorView,
+    targetEditor: MyEditor,
+    insertAtLine: number,
+    reindented: string[],
+  ) {
+    const targetLastLine = targetEditor.lastLine();
+    const insertAtClamped = Math.min(insertAtLine, targetLastLine + 1);
+    let insertOffset: number;
+    let insertPayload: string;
+    if (insertAtClamped > targetLastLine) {
+      insertOffset = targetEditor.posToOffset({
+        line: targetLastLine,
+        ch: targetEditor.getLine(targetLastLine).length,
+      });
+      insertPayload = "\n" + reindented.join("\n");
+    } else {
+      insertOffset = targetEditor.posToOffset({
+        line: insertAtClamped,
+        ch: 0,
+      });
+      insertPayload = reindented.join("\n") + "\n";
+    }
+
+    try {
+      targetView.dispatch({
+        changes: [
+          { from: insertOffset, to: insertOffset, insert: insertPayload },
+        ],
+      });
+    } catch (err) {
+      new Notice(
+        `Failed to insert into target file. Source not modified. (${err})`,
+        5000,
+      );
+      return;
+    }
+
+    const sourceLastLine = sourceEditor.lastLine();
+    let sourceFromOffset: number;
+    let sourceToOffset: number;
+    if (sourceLineEnd < sourceLastLine) {
+      sourceFromOffset = sourceEditor.posToOffset({
+        line: sourceLineStart,
+        ch: 0,
+      });
+      sourceToOffset = sourceEditor.posToOffset({
+        line: sourceLineEnd + 1,
+        ch: 0,
+      });
+    } else if (sourceLineStart > 0) {
+      sourceFromOffset = sourceEditor.posToOffset({
+        line: sourceLineStart - 1,
+        ch: sourceEditor.getLine(sourceLineStart - 1).length,
+      });
+      sourceToOffset = sourceEditor.posToOffset({
+        line: sourceLineEnd,
+        ch: sourceEditor.getLine(sourceLineEnd).length,
+      });
+    } else {
+      sourceFromOffset = sourceEditor.posToOffset({ line: 0, ch: 0 });
+      sourceToOffset = sourceEditor.posToOffset({
+        line: sourceLineEnd,
+        ch: sourceEditor.getLine(sourceLineEnd).length,
+      });
+    }
+
+    try {
+      sourceView.dispatch({
+        changes: [{ from: sourceFromOffset, to: sourceToOffset, insert: "" }],
+      });
+    } catch (err) {
+      new Notice(
+        `Source deletion failed; the moved item is now duplicated and must be removed manually. (${err})`,
+        7000,
+      );
+      return;
+    }
+
+    const movedLineCount = sourceLineEnd - sourceLineStart + 1;
+    const movedLastLine = insertAtClamped + movedLineCount - 1;
+    const movedLastLineText = reindented[reindented.length - 1];
+    targetEditor.setSelections([
+      {
+        anchor: { line: movedLastLine, ch: movedLastLineText.length },
+        head: { line: movedLastLine, ch: movedLastLineText.length },
+      },
+    ]);
+    targetView.focus();
   }
 
   private applyCrossRootMove(
@@ -473,13 +609,13 @@ export class DragAndDrop implements Feature {
 
   private highlightDraggingLines() {
     const { state } = this;
-    const { source, editor, view } = state;
+    const { source, sourceEditor, sourceView } = state;
 
     const lines = [];
     for (let i = source.lineStart; i <= source.lineEnd; i++) {
-      lines.push(editor.posToOffset({ line: i, ch: 0 }));
+      lines.push(sourceEditor.posToOffset({ line: i, ch: 0 }));
     }
-    view.dispatch({
+    sourceView.dispatch({
       effects: [dndStarted.of(lines)],
     });
 
@@ -489,21 +625,31 @@ export class DragAndDrop implements Feature {
   private unhightlightDraggingLines() {
     document.body.classList.remove("outliner-plus-dragging");
 
-    this.state.view.dispatch({
+    this.state.sourceView.dispatch({
       effects: [dndEnded.of()],
     });
+    if (
+      this.state.lastDropTargetView &&
+      this.state.lastDropTargetView !== this.state.sourceView
+    ) {
+      this.state.lastDropTargetView.dispatch({
+        effects: [dndEnded.of()],
+      });
+    }
   }
 
   private drawDropZone() {
     const { state } = this;
-    const { view, editor, dropVariant } = state;
+    const { dropVariant } = state;
+    const view = dropVariant.view;
+    const editor = dropVariant.editor;
+    const data = state.getOrBuildTargetData(view);
 
     const parentInfo = getDropVariantNewParent(dropVariant);
 
     {
       const width = Math.round(
-        view.contentDOM.offsetWidth -
-          (dropVariant.left - this.state.leftPadding),
+        view.contentDOM.offsetWidth - (dropVariant.left - data.leftPadding),
       );
 
       this.dropZone.style.display = "block";
@@ -514,7 +660,7 @@ export class DragAndDrop implements Feature {
 
     {
       const level = parentInfo.level;
-      const indentWidth = this.state.tabWidth;
+      const indentWidth = data.tabWidth;
       const width = indentWidth * level;
       const dashPadding = 3;
       const dashWidth = indentWidth - dashPadding;
@@ -527,7 +673,7 @@ export class DragAndDrop implements Feature {
       this.dropZonePadding.style.backgroundImage = `url('data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%20${width}%204%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cline%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%22${width}%22%20y2%3D%220%22%20stroke%3D%22${color}%22%20stroke-width%3D%228%22%20stroke-dasharray%3D%22${dashWidth}%20${dashPadding}%22%2F%3E%3C%2Fsvg%3E')`;
     }
 
-    this.state.view.dispatch({
+    view.dispatch({
       effects: [
         dndMoved.of(
           parentInfo.parentLine === null
@@ -543,6 +689,21 @@ export class DragAndDrop implements Feature {
 
   private hideDropZone() {
     this.dropZone.style.display = "none";
+  }
+
+  private maybeNoticeEmptyTarget() {
+    const { state } = this;
+    const lastTarget = state.lastDropTargetView;
+    if (!lastTarget || lastTarget === state.sourceView) {
+      return;
+    }
+    const data = state.getOrBuildTargetData(lastTarget);
+    if (data.editor && data.variants.length === 0) {
+      new Notice(
+        `Cannot drop into this file — it has no bullet points to anchor to.`,
+        4000,
+      );
+    }
   }
 }
 
@@ -564,6 +725,8 @@ type DragSource =
 type DropVariant =
   | {
       kind: "strict";
+      view: EditorView;
+      editor: MyEditor;
       line: number;
       level: number;
       left: number;
@@ -574,6 +737,8 @@ type DropVariant =
     }
   | {
       kind: "lenient";
+      view: EditorView;
+      editor: MyEditor;
       line: number;
       level: number;
       left: number;
@@ -582,6 +747,16 @@ type DropVariant =
       whereToMove: "after" | "before" | "inside";
     };
 
+interface TargetViewData {
+  view: EditorView;
+  editor: MyEditor | null;
+  roots: Root[];
+  lenientBullets: LenientBullet[];
+  variants: DropVariant[];
+  leftPadding: number;
+  tabWidth: number;
+}
+
 interface DragAndDropPreStartState {
   x: number;
   y: number;
@@ -589,38 +764,87 @@ interface DragAndDropPreStartState {
 }
 
 class DragAndDropState {
-  private dropVariants: Map<string, DropVariant> = new Map();
   public dropVariant: DropVariant = null;
-  public leftPadding = 0;
-  public tabWidth = 0;
+  public lastDropTargetView: EditorView | null = null;
+
+  private targetCache: Map<EditorView, TargetViewData> = new Map();
 
   constructor(
-    public readonly view: EditorView,
-    public readonly editor: MyEditor,
-    public readonly roots: Root[],
-    public readonly lenientBullets: LenientBullet[],
+    public readonly sourceView: EditorView,
+    public readonly sourceEditor: MyEditor,
     public readonly source: DragSource,
+    private readonly parser: Parser,
+    private readonly tabSize: number,
+    sourceRoots: Root[],
+    sourceLenientBullets: LenientBullet[],
   ) {
-    this.collectDropVariants();
-    this.calculateLeftPadding();
-    this.calculateTabWidth();
+    const sourceData = this.buildTargetData(
+      sourceView,
+      sourceEditor,
+      sourceRoots,
+      sourceLenientBullets,
+    );
+    this.targetCache.set(sourceView, sourceData);
   }
 
-  getDropVariants() {
-    return Array.from(this.dropVariants.values());
+  getSourceData(): TargetViewData {
+    return this.targetCache.get(this.sourceView);
   }
 
-  hasDropVariants() {
-    return this.dropVariants.size > 0;
+  getOrBuildTargetData(view: EditorView): TargetViewData {
+    const cached = this.targetCache.get(view);
+    if (cached) {
+      return cached;
+    }
+
+    const editor = getEditorFromState(view.state);
+    if (!editor) {
+      const empty: TargetViewData = {
+        view,
+        editor: null,
+        roots: [],
+        lenientBullets: [],
+        variants: [],
+        leftPadding: 0,
+        tabWidth: 0,
+      };
+      this.targetCache.set(view, empty);
+      return empty;
+    }
+
+    const roots = parseDocumentByBlankLines(this.parser, editor);
+    const lenientBullets = new LenientBulletScanner().scan(
+      editor,
+      this.tabSize,
+    );
+    const data = this.buildTargetData(view, editor, roots, lenientBullets);
+    this.targetCache.set(view, data);
+    return data;
   }
 
-  calculateNearestDropVariant(x: number, y: number) {
-    const { view, editor } = this;
+  hasAnyDropVariants(): boolean {
+    for (const data of this.targetCache.values()) {
+      if (data.variants.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
 
-    const dropVariants = this.getDropVariants();
-    const possibleDropVariants = [];
+  calculateNearestDropVariantForView(
+    x: number,
+    y: number,
+    data: TargetViewData,
+  ) {
+    const { view, editor, variants, leftPadding, tabWidth } = data;
+    if (!editor) {
+      this.dropVariant = null;
+      return;
+    }
 
-    for (const v of dropVariants) {
+    const possible: DropVariant[] = [];
+
+    for (const v of variants) {
       const positionAfterList =
         v.whereToMove === "after" || v.whereToMove === "inside";
       const line =
@@ -631,68 +855,91 @@ class DragAndDropState {
           : positionAfterList
             ? v.placeToMove.lineEnd
             : v.placeToMove.lineStart;
-      const linePos = editor.posToOffset({
-        line,
-        ch: 0,
-      });
+      const linePos = editor.posToOffset({ line, ch: 0 });
 
       const coords = view.coordsAtPos(linePos, -1);
-
       if (!coords) {
         continue;
       }
 
-      v.left = this.leftPadding + (v.level - 1) * this.tabWidth;
+      v.left = leftPadding + (v.level - 1) * tabWidth;
       v.top = coords.top;
-
       if (positionAfterList) {
         v.top += view.lineBlockAt(linePos).height;
       }
-
-      // Better vertical alignment
       v.top -= 8;
 
-      possibleDropVariants.push(v);
+      possible.push(v);
     }
 
-    if (possibleDropVariants.length === 0) {
+    if (possible.length === 0) {
       this.dropVariant = null;
       return;
     }
 
-    const nearestLineTop = possibleDropVariants
+    const nearestLineTop = possible
       .sort((a, b) => Math.abs(y - a.top) - Math.abs(y - b.top))
       .first().top;
-
-    const variansOnNearestLine = possibleDropVariants.filter(
+    const onNearest = possible.filter(
       (v) => Math.abs(v.top - nearestLineTop) <= 4,
     );
-
-    this.dropVariant = variansOnNearestLine
+    this.dropVariant = onNearest
       .sort((a, b) => Math.abs(x - a.left) - Math.abs(x - b.left))
       .first();
   }
 
-  private addDropVariant(v: DropVariant) {
-    this.dropVariants.set(`${v.line} ${v.level}`, v);
+  private buildTargetData(
+    view: EditorView,
+    editor: MyEditor,
+    roots: Root[],
+    lenientBullets: LenientBullet[],
+  ): TargetViewData {
+    return {
+      view,
+      editor,
+      roots,
+      lenientBullets,
+      variants: this.collectVariantsForView(
+        view,
+        editor,
+        roots,
+        lenientBullets,
+      ),
+      leftPadding: this.computeLeftPadding(view),
+      tabWidth: this.computeTabWidth(view),
+    };
   }
 
-  private collectDropVariants() {
-    const sourceList = this.source.kind === "strict" ? this.source.list : null;
-    const sourceLenient =
-      this.source.kind === "lenient" ? this.source.bullet : null;
+  private collectVariantsForView(
+    view: EditorView,
+    editor: MyEditor,
+    roots: Root[],
+    lenientBullets: LenientBullet[],
+  ): DropVariant[] {
+    const isSourceView = view === this.sourceView;
+    const sourceList =
+      isSourceView && this.source.kind === "strict" ? this.source.list : null;
     const sourceLineStart = this.source.lineStart;
     const sourceLineEnd = this.source.lineEnd;
+
+    const dedup = new Map<string, DropVariant>();
+    const add = (v: DropVariant) => {
+      const key = `${v.line}|${v.level}|${v.whereToMove}`;
+      if (!dedup.has(key)) {
+        dedup.set(key, v);
+      }
+    };
 
     const visit = (lists: List[], targetRoot: Root) => {
       for (const placeToMove of lists) {
         const lineBefore = placeToMove.getFirstLineContentStart().line;
         const lineAfter = placeToMove.getContentEndIncludingChildren().line + 1;
-
         const level = placeToMove.getLevel();
 
-        this.addDropVariant({
+        add({
           kind: "strict",
+          view,
+          editor,
           line: lineBefore,
           level,
           left: 0,
@@ -701,8 +948,10 @@ class DragAndDropState {
           targetRoot,
           whereToMove: "before",
         });
-        this.addDropVariant({
+        add({
           kind: "strict",
+          view,
+          editor,
           line: lineAfter,
           level,
           left: 0,
@@ -717,8 +966,10 @@ class DragAndDropState {
         }
 
         if (placeToMove.isEmpty()) {
-          this.addDropVariant({
+          add({
             kind: "strict",
+            view,
+            editor,
             line: lineAfter,
             level: level + 1,
             left: 0,
@@ -733,16 +984,17 @@ class DragAndDropState {
       }
     };
 
-    for (const root of this.roots) {
+    for (const root of roots) {
       visit(root.getChildren(), root);
     }
 
-    for (const b of this.lenientBullets) {
-      if (findRootContaining(this.roots, b.lineStart)) {
+    for (const b of lenientBullets) {
+      if (findRootContaining(roots, b.lineStart)) {
         continue;
       }
       if (
-        sourceLenient &&
+        isSourceView &&
+        this.source.kind === "lenient" &&
         b.lineStart >= sourceLineStart &&
         b.lineStart <= sourceLineEnd
       ) {
@@ -750,9 +1002,10 @@ class DragAndDropState {
       }
 
       const level = b.visualLevel + 1;
-
-      this.addDropVariant({
+      add({
         kind: "lenient",
+        view,
+        editor,
         line: b.lineStart,
         level,
         left: 0,
@@ -760,8 +1013,10 @@ class DragAndDropState {
         placeToMove: b,
         whereToMove: "before",
       });
-      this.addDropVariant({
+      add({
         kind: "lenient",
+        view,
+        editor,
         line: b.lineEnd + 1,
         level,
         left: 0,
@@ -770,8 +1025,10 @@ class DragAndDropState {
         whereToMove: "after",
       });
       if (b.children.length === 0) {
-        this.addDropVariant({
+        add({
           kind: "lenient",
+          view,
+          editor,
           line: b.lineEnd + 1,
           level: level + 1,
           left: 0,
@@ -781,44 +1038,42 @@ class DragAndDropState {
         });
       }
     }
+
+    return Array.from(dedup.values());
   }
 
-  private calculateLeftPadding() {
-    const cmLine = this.view.dom.querySelector("div.cm-line");
-    this.leftPadding = cmLine.getBoundingClientRect().left;
+  private computeLeftPadding(view: EditorView): number {
+    const cmLine = view.dom.querySelector("div.cm-line");
+    if (!cmLine) {
+      return 0;
+    }
+    return cmLine.getBoundingClientRect().left;
   }
 
-  private calculateTabWidth() {
-    const { view } = this;
-
+  private computeTabWidth(view: EditorView): number {
     const indentDom = view.dom.querySelector(".cm-indent");
     if (indentDom) {
-      this.tabWidth = (indentDom as HTMLElement).offsetWidth;
-      return;
+      return (indentDom as HTMLElement).offsetWidth;
     }
 
     const singleIndent = indentString(view.state, getIndentUnit(view.state));
 
     for (let i = 1; i <= view.state.doc.lines; i++) {
       const line = view.state.doc.line(i);
-
       if (line.text.startsWith(singleIndent)) {
         const a = view.coordsAtPos(line.from, -1);
         if (!a) {
           continue;
         }
-
         const b = view.coordsAtPos(line.from + singleIndent.length, -1);
         if (!b) {
           continue;
         }
-
-        this.tabWidth = b.left - a.left;
-        return;
+        return b.left - a.left;
       }
     }
 
-    this.tabWidth = view.defaultCharacterWidth * getIndentUnit(view.state);
+    return view.defaultCharacterWidth * getIndentUnit(view.state);
   }
 }
 
@@ -899,6 +1154,14 @@ function getEditorViewFromHTMLElement(e: HTMLElement) {
   }
 
   return EditorView.findFromDOM(e);
+}
+
+function findEditorViewAtPoint(x: number, y: number): EditorView | null {
+  const el = document.elementFromPoint(x, y);
+  if (!el) {
+    return null;
+  }
+  return getEditorViewFromHTMLElement(el as HTMLElement);
 }
 
 function isClickOnBullet(e: MouseEvent) {
